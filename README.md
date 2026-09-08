@@ -26,6 +26,16 @@ if err != nil {
 defer m.Shutdown(context.Background())
 ```
 
+Or, when that *is* the whole of `main`:
+
+```go
+func main() {
+	if err := mwc.Main(jobs, ui.Serve("127.0.0.1:8080")); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
 ## Why
 
 A typical service `main` runs three or four things at once: an HTTP server, a
@@ -42,7 +52,10 @@ at 4am the process either ignores it or takes everything down with it.
 - a job that exits cleanly is left alone — finishing is not a failure;
 - a panic inside a job becomes an error instead of a dead process;
 - one `Shutdown` stops everything and waits, returning the joined errors;
-- cancelling the context passed to `Start` does the same thing.
+- cancelling the context passed to `Start` does the same thing;
+- a job marked critical that gives up takes everything down with it, on
+  purpose, so the orchestrator restarts the process instead of routing to a
+  shell of one.
 
 ## The job contract
 
@@ -141,11 +154,68 @@ deliberately no way to steer a job from outside the process.
 | ----------------------------- | ------- | ------------------------------------------------------- |
 | `WithLogger(*slog.Logger)`    | default | where job start/exit/restart events go                  |
 | `WithBackoff(min, max)`       | 1s, 1m  | restart delay: starts at `min`, doubles, capped at `max` |
+| `WithJitter(f)`               | 0       | spread each delay by a random factor in `[1-f, 1+f]`, `f` in 0..1 |
 | `WithMaxRestarts(n)`          | 0       | consecutive restarts per job; 0 means unlimited          |
 | `WithStableAfter(d)`          | 1m      | how long a job must run before its restart count resets; 0 never resets |
-| `WithShutdownTimeout(d)`      | 30s     | bounds the graceful stop when `Start`'s context is cancelled |
+| `WithShutdownTimeout(d)`      | 30s     | bounds the graceful stop when `Start`'s context is cancelled, when a critical job fails, and in `Main` |
 | `WithObserver(fn)`            | —       | watch the running manager until `Stopping()`; `Shutdown` waits for it |
 | `WithOnStateChange(fn)`       | —       | called with the name and new `Status` on every state change |
+| `WithJob(name, ...JobOption)` | —       | override the restart policy for one job, see below      |
+
+Jitter is for fleets: ten replicas that lost the same database would
+otherwise retry it in lockstep, at exactly 1s, 2s, 4s. With
+`WithJitter(0.2)` a 4s delay lands anywhere in 3.2s..4.8s.
+
+### Per-job policy
+
+The restart options above apply to every job. `WithJob` changes them for one,
+starting from those defaults:
+
+```go
+mwc.WithMaxRestarts(10),                          // every job
+mwc.WithJob("db", mwc.MaxRestarts(3), mwc.Critical()),
+mwc.WithJob("scraper", mwc.Backoff(5*time.Second, 10*time.Minute), mwc.Jitter(0.5)),
+```
+
+`Backoff`, `Jitter`, `MaxRestarts` and `StableAfter` are the job-level twins
+of the `With*` options. Naming a job that is not in the map fails `Start`: a
+typo would otherwise leave the job silently on the defaults.
+
+`Critical()` marks a job the process is useless without. When it goes
+`failed` (its restart limit exhausted), the manager stops every other job
+gracefully, the same way as on `Shutdown`, and `Done()` closes. Without it,
+a process whose core has died keeps running, and only the readiness probe
+knows. A critical job needs a restart limit, its own or the global one;
+`Start` refuses one without, since it could never give up. A critical job
+that exits cleanly is a job that finished, and stops nothing.
+
+## Main
+
+`Main` is `Start`, a signal handler, a wait and a `Shutdown`, for the common
+`main` that has nothing else to do:
+
+```go
+func main() {
+	if err := mwc.Main(jobs, mwc.WithLogger(log), ui.Serve("127.0.0.1:8080")); err != nil {
+		log.Fatal(err)
+	}
+}
+```
+
+It runs the jobs until SIGINT or SIGTERM, or until no job is running any
+more, then stops everything, bounded by `WithShutdownTimeout`. The error is
+`Start`'s if a job failed to start; otherwise it joins the shutdown errors
+with one per job that ended `failed`, so a process whose jobs died exits
+non-zero while a signal after a quiet run returns `nil`. Jobs that all exited
+cleanly are a normal end too.
+
+`Main` never hands the `*Manager` out. Whatever needs it, a `/healthz`
+handler for instance, gets it through an `Observer`:
+
+```go
+var manager atomic.Pointer[mwc.Manager]
+mwc.Main(jobs, mwc.WithObserver(func(m *mwc.Manager) { manager.Store(m) }))
+```
 
 ## The UI
 
@@ -199,7 +269,9 @@ cd example && go run .
 
 Two jobs and the status page on <http://127.0.0.1:8080>: an HTTP server that
 stays up, and a mailer that fails every five seconds so you can watch the
-restart counter and the backoff at work. Ctrl-C stops everything.
+restart counter and the backoff at work. The server is marked critical with
+three restarts: take its port away and the whole process winds down. Ctrl-C
+stops everything.
 
 The example is a separate module, like `mwc/metrics`, so that `mwc` itself
 stays free of dependencies while the demo can have some; `go.work` ties the

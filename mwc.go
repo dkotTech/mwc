@@ -69,17 +69,22 @@ func WithLogger(l *slog.Logger) Option { return func(m *Manager) { m.log = l } }
 // WithBackoff sets the restart delay: it doubles from min up to max.
 // Default: 1s, 1m.
 func WithBackoff(min, max time.Duration) Option {
-	return func(m *Manager) { m.backoffMin, m.backoffMax = min, max }
+	return func(m *Manager) { m.policy.backoffMin, m.policy.backoffMax = min, max }
 }
+
+// WithJitter spreads each restart delay by a random factor in [1-f, 1+f],
+// so replicas that lost the same dependency do not all retry in the same
+// instant. f is clamped to 0..1. Default: 0, no jitter.
+func WithJitter(f float64) Option { return func(m *Manager) { m.policy.jitter = f } }
 
 // WithMaxRestarts caps consecutive restarts per job, which then goes Failed.
 // Default: 0, unlimited.
-func WithMaxRestarts(n int) Option { return func(m *Manager) { m.maxRestarts = n } }
+func WithMaxRestarts(n int) Option { return func(m *Manager) { m.policy.maxRestarts = n } }
 
 // WithStableAfter sets how long a job must run to reset its restart counter
 // and backoff. Default: 1m. 0 means never: the counter only grows, so
 // WithMaxRestarts counts every failure over the job's lifetime.
-func WithStableAfter(d time.Duration) Option { return func(m *Manager) { m.stableAfter = d } }
+func WithStableAfter(d time.Duration) Option { return func(m *Manager) { m.policy.stableAfter = d } }
 
 // Observer watches a running Manager, typically to render its Status; see
 // package mwc/ui. It runs in its own goroutine and must return on
@@ -111,10 +116,8 @@ func WithOnStateChange(fn func(name string, s Status)) Option {
 // Manager supervises a set of jobs.
 type Manager struct {
 	log             *slog.Logger
-	backoffMin      time.Duration
-	backoffMax      time.Duration
-	maxRestarts     int
-	stableAfter     time.Duration
+	policy          policy // defaults; see WithJob
+	jobOpts         map[string][]JobOption
 	shutdownTimeout time.Duration
 
 	jobCtx context.Context // parent of every job context; never cancelled
@@ -138,6 +141,7 @@ type Manager struct {
 type jobState struct {
 	name   string
 	start  StartFunc
+	policy policy
 	status Status
 }
 
@@ -149,10 +153,12 @@ func Start(ctx context.Context, jobs map[string]StartFunc, opts ...Option) (*Man
 		return nil, fmt.Errorf("mwc: start: %w", err)
 	}
 	m := &Manager{
-		log:             slog.Default(),
-		backoffMin:      time.Second,
-		backoffMax:      time.Minute,
-		stableAfter:     time.Minute,
+		log: slog.Default(),
+		policy: policy{
+			backoffMin:  time.Second,
+			backoffMax:  time.Minute,
+			stableAfter: time.Minute,
+		},
 		shutdownTimeout: 30 * time.Second,
 		jobCtx:          context.WithoutCancel(ctx),
 		done:            make(chan struct{}),
@@ -163,19 +169,33 @@ func Start(ctx context.Context, jobs map[string]StartFunc, opts ...Option) (*Man
 	for _, o := range opts {
 		o(m)
 	}
-	m.backoffMin = max(m.backoffMin, time.Millisecond)
-	m.backoffMax = max(m.backoffMax, m.backoffMin)
+	m.policy.normalize()
 
 	// Validate first, then start in a deterministic order.
+	for name := range m.jobOpts {
+		if _, ok := jobs[name]; !ok {
+			return nil, fmt.Errorf("mwc: WithJob %q: no such job", name)
+		}
+	}
 	names := slices.Sorted(maps.Keys(jobs))
+	policies := make(map[string]policy, len(jobs))
 	for _, name := range names {
 		if jobs[name] == nil {
 			return nil, fmt.Errorf("mwc: job %q: nil start function", name)
 		}
+		p := m.policy
+		for _, o := range m.jobOpts[name] {
+			o(&p)
+		}
+		p.normalize()
+		if p.critical && p.maxRestarts == 0 {
+			return nil, fmt.Errorf("mwc: job %q: Critical needs a restart limit, see MaxRestarts", name)
+		}
+		policies[name] = p
 	}
 
 	for _, name := range names {
-		s := &jobState{name: name, start: jobs[name]}
+		s := &jobState{name: name, start: jobs[name], policy: policies[name]}
 		job, cancelJob, err := m.launch(s)
 		if err != nil {
 			rollbackCtx, cancel := context.WithTimeout(ctx, m.shutdownTimeout)
@@ -362,9 +382,10 @@ func (m *Manager) restart(s *jobState, err error) (*Job, context.CancelFunc, boo
 	default:
 	}
 
+	p := &s.policy
 	m.mu.Lock()
 	uptime := time.Since(s.status.Since)
-	if m.stableAfter > 0 && uptime >= m.stableAfter {
+	if p.stableAfter > 0 && uptime >= p.stableAfter {
 		s.status.Restarts = 0
 	}
 	m.mu.Unlock()
@@ -375,13 +396,17 @@ func (m *Manager) restart(s *jobState, err error) (*Job, context.CancelFunc, boo
 		s.status.Restarts++
 		attempt := s.status.Restarts
 		m.mu.Unlock()
-		if m.maxRestarts > 0 && attempt > m.maxRestarts {
-			m.log.Error("job restart limit reached, giving up", "job", s.name, "restarts", m.maxRestarts, "err", err)
+		if p.maxRestarts > 0 && attempt > p.maxRestarts {
+			m.log.Error("job restart limit reached, giving up", "job", s.name, "restarts", p.maxRestarts, "err", err)
 			m.setStatus(s, Failed, err)
+			if p.critical {
+				m.log.Error("critical job failed, stopping every job", "job", s.name)
+				m.stopFromInside()
+			}
 			return nil, nil, false
 		}
 
-		delay := m.backoff(attempt)
+		delay := p.backoff(attempt)
 		m.log.Warn("job restart scheduled", "job", s.name, "attempt", attempt, "delay", delay)
 		m.setStatus(s, Restarting, err)
 		select {
@@ -401,17 +426,17 @@ func (m *Manager) restart(s *jobState, err error) (*Job, context.CancelFunc, boo
 	}
 }
 
-// backoff for attempt n (1-based): exponential from backoffMin, capped at
-// backoffMax.
-func (m *Manager) backoff(attempt int) time.Duration {
-	d := m.backoffMin
-	for i := 1; i < attempt && d > 0 && d < m.backoffMax; i++ {
-		d *= 2
-	}
-	if d <= 0 { // overflow
-		return m.backoffMax
-	}
-	return min(d, m.backoffMax)
+// stopFromInside is the stop the Manager asks for itself, when a critical
+// job has failed: graceful, bounded by WithShutdownTimeout, like the one on
+// the cancellation of Start's context. It does not wait: the caller is a
+// supervisor goroutine, and Done closes once every job has stopped.
+func (m *Manager) stopFromInside() {
+	stopCtx, cancel := context.WithTimeout(m.jobCtx, m.shutdownTimeout)
+	m.stop(stopCtx)
+	go func() {
+		<-m.done
+		cancel()
+	}()
 }
 
 // stopJob calls Shutdown, cancels the job context and waits for the exit.

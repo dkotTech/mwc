@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"sync/atomic"
 	"time"
 
@@ -31,9 +30,6 @@ import (
 )
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-
 	cfg := zap.NewDevelopmentConfig() // JSON on stderr
 	zl, err := cfg.Build()
 	if err != nil {
@@ -62,23 +58,25 @@ func main() {
 		health.Handler(m).ServeHTTP(w, r)
 	})
 
-	m, err := mwc.Start(ctx, map[string]mwc.StartFunc{"api": api(mux), "mailer": mailer},
+	// Main runs the jobs until Ctrl-C and shuts them down; the error is a
+	// failed Start, a failed Shutdown or a job that gave up.
+	err = mwc.Main(map[string]mwc.StartFunc{"api": api(mux), "mailer": mailer},
 		mwc.WithLogger(log),
+		mwc.WithJitter(0.2),
+		// The api is the process: if it cannot be kept up, stop everything
+		// and let the orchestrator restart the whole thing.
+		mwc.WithJob("api", mwc.MaxRestarts(3), mwc.Critical()),
 		prom.Option(),
 		// Where metrics or alerts would hook in; here it only logs.
 		mwc.WithOnStateChange(func(name string, s mwc.Status) {
 			log.Debug("state change", "job", name, "state", s.State.String(), "restarts", s.Restarts)
 		}),
+		// Main never hands the Manager out; an Observer gets it at Start.
+		mwc.WithObserver(func(m *mwc.Manager) { manager.Store(m) }),
 		ui.Serve("127.0.0.1:8080"))
 	if err != nil {
-		log.Error("start", "err", err)
+		log.Error("mwc", "err", err)
 		os.Exit(1)
-	}
-	manager.Store(m)
-
-	<-ctx.Done()
-	if err := m.Shutdown(context.Background()); err != nil {
-		log.Error("shutdown", "err", err)
 	}
 }
 

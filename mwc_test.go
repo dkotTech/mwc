@@ -366,18 +366,252 @@ func TestShutdownDeadlineReportsTheObserver(t *testing.T) {
 }
 
 func TestBackoff(t *testing.T) {
-	m := &Manager{backoffMin: time.Second, backoffMax: 10 * time.Second}
-	if got := m.backoff(0); got != time.Second {
+	p := &policy{backoffMin: time.Second, backoffMax: 10 * time.Second}
+	if got := p.backoff(0); got != time.Second {
 		t.Errorf("backoff(0) = %v, want 1s", got)
 	}
 	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 10 * time.Second, 10 * time.Second}
 	for i, w := range want {
-		if got := m.backoff(i + 1); got != w {
+		if got := p.backoff(i + 1); got != w {
 			t.Errorf("backoff(%d) = %v, want %v", i+1, got, w)
 		}
 	}
-	if got := m.backoff(100); got != 10*time.Second {
+	if got := p.backoff(100); got != 10*time.Second {
 		t.Errorf("backoff(100) = %v (overflow?)", got)
+	}
+}
+
+func TestBackoffJitter(t *testing.T) {
+	p := &policy{backoffMin: time.Second, backoffMax: 10 * time.Second, jitter: 0.5}
+	var distinct int
+	prev := time.Duration(-1)
+	for range 100 {
+		got := p.backoff(3) // 4s before jitter
+		if got < 2*time.Second || got > 6*time.Second {
+			t.Fatalf("backoff = %v, want within 4s ± 50%%", got)
+		}
+		if got != prev {
+			distinct++
+		}
+		prev = got
+	}
+	if distinct < 2 {
+		t.Fatal("jitter never changed the delay")
+	}
+	// The cap is jittered too, not applied after: the max can be exceeded by
+	// the jitter fraction and no more.
+	for range 100 {
+		if got := p.backoff(100); got < 5*time.Second || got > 15*time.Second {
+			t.Fatalf("backoff at cap = %v, want within 10s ± 50%%", got)
+		}
+	}
+}
+
+func TestJitterIsClamped(t *testing.T) {
+	m, err := Start(context.Background(), map[string]StartFunc{"a": idle(nil)},
+		fastOpts(WithJitter(7), WithJob("a", Jitter(-3)))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Shutdown(context.Background())
+	if got := m.policy.jitter; got != 1 {
+		t.Errorf("manager jitter = %v, want 1", got)
+	}
+	m.mu.Lock()
+	got := m.jobs["a"].policy.jitter
+	m.mu.Unlock()
+	if got != 0 {
+		t.Errorf("job jitter = %v, want 0", got)
+	}
+}
+
+func TestWithJobOverridesDefaults(t *testing.T) {
+	var starts atomic.Int32
+	flaky := func(ctx context.Context) (*Job, error) {
+		starts.Add(1)
+		return Run(func() error { return errors.New("dead") }, nil), nil
+	}
+	m, err := Start(context.Background(), map[string]StartFunc{"flaky": flaky, "steady": idle(nil)},
+		fastOpts(WithMaxRestarts(10), WithJob("flaky", MaxRestarts(2)))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Shutdown(context.Background())
+
+	waitFor(t, func() bool { return m.Status()["flaky"].State == Failed })
+	if starts.Load() != 3 { // initial + 2 restarts, not 10
+		t.Fatalf("starts = %d, want 3", starts.Load())
+	}
+	if !isRunning(m, "steady") {
+		t.Fatal("a non-critical failure took the other job down")
+	}
+	m.mu.Lock()
+	steady := m.jobs["steady"].policy.maxRestarts
+	m.mu.Unlock()
+	if steady != 10 {
+		t.Fatalf("steady keeps the default: maxRestarts = %d, want 10", steady)
+	}
+}
+
+func TestWithJobUnknownNameFailsStart(t *testing.T) {
+	_, err := Start(context.Background(), map[string]StartFunc{"a": idle(nil)},
+		fastOpts(WithJob("b", MaxRestarts(1)))...)
+	if err == nil || !strings.Contains(err.Error(), `WithJob "b": no such job`) {
+		t.Fatalf("err = %v, want the unknown job named", err)
+	}
+}
+
+func TestCriticalNeedsRestartLimit(t *testing.T) {
+	var started atomic.Bool
+	track := func(ctx context.Context) (*Job, error) {
+		started.Store(true)
+		return idle(nil)(ctx)
+	}
+	_, err := Start(context.Background(), map[string]StartFunc{"a": track},
+		fastOpts(WithJob("a", Critical()))...)
+	if err == nil || !strings.Contains(err.Error(), "Critical needs a restart limit") {
+		t.Fatalf("err = %v, want a refusal", err)
+	}
+	if started.Load() {
+		t.Fatal("a job was started before validation finished")
+	}
+	// The global limit counts.
+	m, err := Start(context.Background(), map[string]StartFunc{"a": idle(nil)},
+		fastOpts(WithMaxRestarts(1), WithJob("a", Critical()))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Shutdown(context.Background())
+}
+
+func TestCriticalFailureStopsEverything(t *testing.T) {
+	var stopped atomic.Int32
+	other := idle(func(context.Context) error { stopped.Add(1); return nil })
+	m, err := Start(context.Background(), map[string]StartFunc{
+		"core": func(ctx context.Context) (*Job, error) {
+			return Run(func() error { return errors.New("dead") }, nil), nil
+		},
+		"a":     other,
+		"b":     other,
+		"ended": func(ctx context.Context) (*Job, error) { return Run(func() error { return nil }, nil), nil },
+	}, fastOpts(WithJob("core", MaxRestarts(2), Critical()))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-m.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Done not closed after the critical job failed")
+	}
+	select {
+	case <-m.Stopping():
+	default:
+		t.Fatal("Stopping not closed: the stop should look like a Shutdown")
+	}
+	if stopped.Load() != 2 {
+		t.Fatalf("stopped %d other jobs, want 2", stopped.Load())
+	}
+	st := m.Status()
+	if st["core"].State != Failed || st["core"].Restarts != 3 {
+		t.Errorf("core: %+v, want failed after 3 attempts", st["core"])
+	}
+	for _, name := range []string{"a", "b"} {
+		if st[name].State != Stopped {
+			t.Errorf("%s: state %v, want stopped", name, st[name].State)
+		}
+	}
+	if st["ended"].State != Exited {
+		t.Errorf("ended: state %v, want exited: it was over before the stop", st["ended"].State)
+	}
+	if err := m.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown after a critical stop: %v", err)
+	}
+}
+
+func TestCriticalCleanExitStopsNothing(t *testing.T) {
+	m, err := Start(context.Background(), map[string]StartFunc{
+		"core": func(ctx context.Context) (*Job, error) { return Run(func() error { return nil }, nil), nil },
+		"a":    idle(nil),
+	}, fastOpts(WithJob("core", MaxRestarts(1), Critical()))...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Shutdown(context.Background())
+	waitFor(t, func() bool { return m.Status()["core"].State == Exited })
+	time.Sleep(10 * time.Millisecond)
+	if !isRunning(m, "a") {
+		t.Fatal("a critical job's clean exit stopped another job")
+	}
+}
+
+func TestRunStopsOnSignalContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var stopped atomic.Bool
+	errc := make(chan error, 1)
+	go func() {
+		errc <- run(ctx, map[string]StartFunc{
+			"a": idle(func(context.Context) error { stopped.Store(true); return nil }),
+		}, fastOpts()...)
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancel() // the signal
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("run = %v, want nil on a signal", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return after the signal")
+	}
+	if !stopped.Load() {
+		t.Fatal("the job was not shut down")
+	}
+}
+
+func TestRunReturnsWhenJobsDie(t *testing.T) {
+	err := run(context.Background(), map[string]StartFunc{
+		"flaky": func(ctx context.Context) (*Job, error) {
+			return Run(func() error { return errors.New("dead") }, nil), nil
+		},
+		"done": func(ctx context.Context) (*Job, error) { return Run(func() error { return nil }, nil), nil },
+	}, fastOpts(WithMaxRestarts(1))...)
+	if err == nil || err.Error() != `mwc: job "flaky" failed: dead` {
+		t.Fatalf("run = %v, want the failed job", err)
+	}
+
+	// All exited cleanly: a normal end.
+	err = run(context.Background(), map[string]StartFunc{
+		"done": func(ctx context.Context) (*Job, error) { return Run(func() error { return nil }, nil), nil },
+	}, fastOpts()...)
+	if err != nil {
+		t.Fatalf("run = %v, want nil when every job exited", err)
+	}
+}
+
+func TestRunReportsStartError(t *testing.T) {
+	err := run(context.Background(), map[string]StartFunc{
+		"bad": func(ctx context.Context) (*Job, error) { return nil, errors.New("no port") },
+	}, fastOpts()...)
+	if err == nil || !strings.Contains(err.Error(), "no port") {
+		t.Fatalf("run = %v, want the start error", err)
+	}
+}
+
+func TestRunJoinsShutdownErrorsWithFailures(t *testing.T) {
+	err := run(context.Background(), map[string]StartFunc{
+		"core": func(ctx context.Context) (*Job, error) {
+			return Run(func() error { return errors.New("dead") }, nil), nil
+		},
+		"bad": idle(func(context.Context) error { return errors.New("cannot stop") }),
+	}, fastOpts(WithJob("core", MaxRestarts(1), Critical()))...)
+	if err == nil {
+		t.Fatal("run = nil, want errors")
+	}
+	for _, want := range []string{`job "bad": shutdown: cannot stop`, `job "core" failed: dead`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to contain %q", err, want)
+		}
 	}
 }
 
