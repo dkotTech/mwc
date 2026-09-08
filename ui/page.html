@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mwc jobs</title>
+<noscript><meta http-equiv="refresh" content="5"></noscript>
+<style>
+@font-face {
+  font-family: "Departure Mono";
+  src: url("font.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: block;
+}
+
+:root {
+  --bg: #fff; --fg: #000; --line: #000;
+  --running: #3f6b52; --restarting: #8a6520; --failed: #9b3d33; --exited: #45607f; --stopped: #6f6f6f;
+  --sun: none; --moon: block;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000; --fg: #fff; --line: #fff;
+    --running: #86b39a; --restarting: #cfa961; --failed: #d1867c; --exited: #93aecd; --stopped: #9b9b9b;
+    --sun: block; --moon: none;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #000; --fg: #fff; --line: #fff;
+  --running: #86b39a; --restarting: #cfa961; --failed: #d1867c; --exited: #93aecd; --stopped: #9b9b9b;
+  --sun: block; --moon: none;
+}
+
+* { box-sizing: border-box; }
+::selection { background: var(--fg); color: var(--bg); }
+
+body {
+  margin: 0; padding: 22px 11px 44px; background: var(--bg); color: var(--fg);
+  font: 11px/22px "Departure Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  text-transform: uppercase; letter-spacing: 1px;
+  -webkit-font-smoothing: none; font-smooth: never;
+}
+main { max-width: 1078px; margin: 0 auto; }
+a { color: inherit; }
+
+.rule { overflow: hidden; white-space: nowrap; line-height: 11px; user-select: none; margin: 11px 0; }
+.stars::after { content: "***********************************************************************************************************************************************************************************"; }
+.slash::after { content: "///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////"; }
+
+.strip { display: flex; gap: 11px; align-items: center; border-bottom: 1px solid var(--line); padding-bottom: 5px; }
+.strip .spacer { flex: 1; overflow: hidden; white-space: nowrap; user-select: none; }
+.strip .spacer::after { content: "· · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · · ·"; }
+.inv { background: var(--fg); color: var(--bg); padding: 0 4px; }
+#theme { display: none; padding: 0; border: 0; background: none; color: inherit; cursor: pointer; line-height: 0; }
+[data-js] #theme { display: block; }
+#theme .sun { display: var(--sun); }
+#theme .moon { display: var(--moon); }
+
+.head { display: flex; align-items: flex-end; gap: 11px; margin: 22px 0 11px; }
+h1 { font-size: 44px; line-height: 44px; letter-spacing: 11px; font-weight: 400; margin: 0; }
+.head .rule { flex: 1; margin: 0 0 11px; }
+#summary { display: inline-block; background: var(--fg); color: var(--bg); padding: 0 5px; margin: 0 0 11px; }
+@media (max-width: 620px) { h1 { font-size: 22px; line-height: 22px; letter-spacing: 5px; } }
+
+.scroll { overflow-x: auto; border: 1px solid var(--line); }
+
+table { width: 100%; min-width: 880px; border-collapse: collapse; table-layout: fixed; }
+col:nth-child(1) { width: 220px; }
+col:nth-child(2) { width: 132px; }
+col:nth-child(3) { width: 66px; }
+col:nth-child(4) { width: 88px; }
+th, td { text-align: left; padding: 6px 11px; white-space: nowrap; vertical-align: top; }
+thead th { border-bottom: 1px solid var(--line); font-weight: 400; }
+tbody tr {
+  background-image: repeating-linear-gradient(to right, var(--line) 0 4px, transparent 4px 8px);
+  background-size: 100% 1px; background-position: left bottom; background-repeat: repeat-x;
+}
+tbody tr:last-child { background-image: none; }
+td.job::before { content: "> "; }
+td.num, td.age { font-variant-numeric: tabular-nums; }
+td.err { white-space: normal; max-width: 418px; text-transform: none; }
+[data-state="failed"] td.err, [data-state="restarting"] td.err { color: var(--c); }
+td.empty { text-align: center; padding: 22px; }
+
+.st { display: inline-block; padding: 0 4px; border: 1px solid transparent; color: var(--c); }
+[data-state="running"] { --c: var(--running); }
+[data-state="restarting"] { --c: var(--restarting); }
+[data-state="failed"] { --c: var(--failed); }
+[data-state="exited"] { --c: var(--exited); }
+[data-state="stopped"] { --c: var(--stopped); }
+[data-state="running"] .st { background: var(--c); color: var(--bg); }
+[data-state="failed"] .st { background: var(--c); color: var(--bg); animation: blink .7s steps(1) infinite; }
+[data-state="restarting"] .st { border-style: dashed; border-color: var(--c); animation: blink 1s steps(1) infinite; }
+[data-state="exited"] .st { border-style: solid; border-color: var(--c); }
+[data-state="stopped"] .st { border-style: dotted; border-color: var(--c); }
+@keyframes blink { 50% { opacity: .25; } }
+
+footer { display: flex; gap: 11px; align-items: center; margin-top: 11px; }
+footer .spacer { flex: 1; overflow: hidden; white-space: nowrap; user-select: none; }
+footer .spacer::after { content: "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"; }
+body[data-stale="true"] #live { animation: blink .7s steps(1) infinite; }
+</style>
+<script>
+  try {
+    var saved = localStorage.getItem("theme");
+    if (saved) document.documentElement.dataset.theme = saved;
+  } catch (e) {}
+  document.documentElement.dataset.js = "1";
+</script>
+</head>
+<body>
+<main>
+  <div class="strip">
+    <span>MWC</span><span>JOB SUPERVISOR</span>
+    <span class="spacer"></span>
+    <button id="theme" type="button" title="switch theme" aria-label="switch theme">
+      <svg class="moon" width="11" height="11" viewBox="0 0 11 11" fill="currentColor" shape-rendering="crispEdges" aria-hidden="true">
+        <rect x="4" y="1" width="3" height="1"/><rect x="3" y="2" width="3" height="1"/>
+        <rect x="2" y="3" width="3" height="5"/><rect x="3" y="8" width="3" height="1"/>
+        <rect x="4" y="9" width="3" height="1"/>
+      </svg>
+      <svg class="sun" width="11" height="11" viewBox="0 0 11 11" fill="currentColor" shape-rendering="crispEdges" aria-hidden="true">
+        <rect x="4" y="4" width="3" height="3"/>
+        <rect x="5" y="0" width="1" height="2"/><rect x="5" y="9" width="1" height="2"/>
+        <rect x="0" y="5" width="2" height="1"/><rect x="9" y="5" width="2" height="1"/>
+        <rect x="2" y="2" width="1" height="1"/><rect x="8" y="2" width="1" height="1"/>
+        <rect x="2" y="8" width="1" height="1"/><rect x="8" y="8" width="1" height="1"/>
+      </svg>
+    </button>
+    <span class="inv" id="clock">--:--:--</span>
+  </div>
+
+  <div class="head">
+    <h1>STATUS</h1>
+    <div class="rule stars"></div>
+  </div>
+  <p id="summary">{{.Summary}}</p>
+  <div class="rule slash"></div>
+
+  <div class="scroll">
+    <table>
+      <colgroup><col><col><col><col><col></colgroup>
+      <thead><tr><th>Job</th><th>State</th><th>Rst</th><th>For</th><th>Last error</th></tr></thead>
+      <tbody id="jobs">
+        {{range .Jobs}}
+        <tr data-state="{{.State}}">
+          <td class="job">{{.Name}}</td>
+          <td><span class="st">{{.State}}</span></td>
+          <td class="num">{{if .Restarts}}{{.Restarts}}{{else}}-{{end}}</td>
+          <td class="age">{{.For}}</td>
+          <td class="err">{{if .LastError}}{{.LastError}}{{else}}-{{end}}</td>
+        </tr>
+        {{else}}
+        <tr><td class="empty" colspan="5">no jobs</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  <div class="rule stars"></div>
+
+  <footer>
+    <span class="inv" id="live">[LIVE]</span>
+    <span>REFRESH 1S</span>
+    <span class="spacer"></span>
+    <a href="api/status">[JSON]</a>
+  </footer>
+</main>
+<script>
+const REFRESH = 1000;
+const base = location.href.endsWith("/") ? location.href : location.href + "/";
+const endpoint = new URL("api/status", base);
+
+function dur(ms) {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + "m" + (s % 60) + "s";
+  const h = Math.floor(m / 60);
+  return h + "h" + (m % 60) + "m" + (s % 60) + "s";
+}
+
+function cell(row, cls, text) {
+  const td = row.insertCell();
+  td.className = cls;
+  td.textContent = text;
+  return td;
+}
+
+function render(data) {
+  const counts = new Map();
+  const body = document.createElement("tbody");
+  body.id = "jobs";
+
+  for (const job of data.jobs) {
+    counts.set(job.state, (counts.get(job.state) || 0) + 1);
+    const row = body.insertRow();
+    row.dataset.state = job.state;
+    cell(row, "job", job.name);
+    const pill = document.createElement("span");
+    pill.className = "st";
+    pill.textContent = job.state;
+    row.insertCell().append(pill);
+    cell(row, "num", job.restarts || "-");
+    cell(row, "age", dur(job.forMs));
+    cell(row, "err", job.lastError || "-");
+  }
+  if (!data.jobs.length) {
+    cell(body.insertRow(), "empty", "no jobs").colSpan = 5;
+  }
+  document.getElementById("jobs").replaceWith(body);
+
+  const order = ["running", "restarting", "failed", "exited", "stopped"];
+  document.getElementById("summary").textContent = order
+    .filter((s) => counts.has(s))
+    .map((s) => counts.get(s) + " " + s)
+    .join(" · ");
+}
+
+async function poll() {
+  try {
+    const res = await fetch(endpoint, { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status);
+    render(await res.json());
+    document.body.dataset.stale = "false";
+    document.getElementById("live").textContent = "[LIVE]";
+  } catch {
+    document.body.dataset.stale = "true";
+    document.getElementById("live").textContent = "[NO SIGNAL]";
+  }
+}
+
+document.getElementById("theme").addEventListener("click", () => {
+  const root = document.documentElement;
+  const current = root.dataset.theme ||
+    (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  const next = current === "dark" ? "light" : "dark";
+  root.dataset.theme = next;
+  try {
+    localStorage.setItem("theme", next);
+  } catch (e) {}
+});
+
+function clock() {
+  document.getElementById("clock").textContent = new Date().toTimeString().slice(0, 8);
+}
+
+poll();
+clock();
+setInterval(poll, REFRESH);
+setInterval(clock, 1000);
+</script>
+</body>
+</html>
